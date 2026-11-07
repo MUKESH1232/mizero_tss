@@ -103,6 +103,75 @@ function validateCredentials({ username, email, password }, includeUsername = fa
   return null
 }
 
+function getAttendanceDate(value) {
+  const date = value ?? new Date().toISOString().slice(0, 10)
+  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return null
+  }
+
+  const [year, month, day] = date.split('-').map(Number)
+  const parsedDate = new Date(Date.UTC(year, month - 1, day))
+  if (
+    parsedDate.getUTCFullYear() !== year
+    || parsedDate.getUTCMonth() !== month - 1
+    || parsedDate.getUTCDate() !== day
+  ) return null
+
+  return date
+}
+
+async function requireAuth(request, response, next) {
+  const token = request.cookies[sessionCookie]
+  if (!token) {
+    response.status(401).json({ message: 'You are not signed in.' })
+    return
+  }
+
+  let payload
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET)
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      response.clearCookie(sessionCookie, clearCookieOptions)
+      response.status(401).json({ message: 'Your session has expired. Please sign in again.' })
+      return
+    }
+
+    next(error)
+    return
+  }
+
+  try {
+    const [users] = await pool.execute(
+      'SELECT id, user_name, user_email, role FROM signup WHERE id = ? LIMIT 1',
+      [payload.sub],
+    )
+    const user = users[0]
+
+    if (!user) {
+      response.clearCookie(sessionCookie, clearCookieOptions)
+      response.status(401).json({ message: 'Your account could not be found.' })
+      return
+    }
+
+    request.authUser = user
+    next()
+  } catch (error) {
+    next(error)
+  }
+}
+
+function requireStaff(request, response, next) {
+  if (request.authUser.role !== 'staff') {
+    response.status(403).json({ message: 'Staff access is required to manage student records.' })
+    return
+  }
+
+  next()
+}
+
+const allowedTrades = new Set(['BDC', 'CSA', 'FBO', 'FD', 'Software'])
+
 app.post('/api/auth/register', authRateLimit, async (request, response, next) => {
   const { username, email, password } = request.body ?? {}
   const validationError = validateCredentials({ username, email, password }, true)
@@ -173,42 +242,178 @@ app.post('/api/auth/login', authRateLimit, async (request, response, next) => {
   }
 })
 
-app.get('/api/auth/me', async (request, response, next) => {
-  const token = request.cookies[sessionCookie]
-  if (!token) {
-    response.status(401).json({ message: 'You are not signed in.' })
-    return
-  }
+app.get('/api/auth/me', requireAuth, (request, response) => {
+  response.json({
+    user: {
+      name: request.authUser.user_name,
+      email: request.authUser.user_email,
+      isStaff: request.authUser.role === 'staff',
+    },
+  })
+})
 
-  let payload
-  try {
-    payload = jwt.verify(token, process.env.JWT_SECRET)
-  } catch (error) {
-    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
-      response.clearCookie(sessionCookie, clearCookieOptions)
-      response.status(401).json({ message: 'Your session has expired. Please sign in again.' })
-      return
-    }
-
-    next(error)
+app.get('/api/students', requireAuth, requireStaff, async (request, response, next) => {
+  const attendanceDate = getAttendanceDate(request.query.date)
+  if (!attendanceDate) {
+    response.status(400).json({ message: 'Enter a valid attendance date.' })
     return
   }
 
   try {
-    const [users] = await pool.execute(
-      'SELECT user_name, user_email FROM signup WHERE id = ? LIMIT 1',
-      [payload.sub],
+    const [students] = await pool.execute(
+      `SELECT s.id, s.admission_number AS admissionNumber, s.full_name AS name,
+        s.trade, s.class_name AS className,
+        COALESCE(a.status, 'unmarked') AS attendanceStatus
+      FROM students s
+      LEFT JOIN student_attendance a
+        ON a.student_id = s.id AND a.attendance_date = ?
+      ORDER BY s.full_name, s.admission_number`,
+      [attendanceDate],
     )
-    const user = users[0]
+    response.json({ students })
+  } catch (error) {
+    next(error)
+  }
+})
 
-    if (!user) {
-      response.clearCookie(sessionCookie, clearCookieOptions)
-      response.status(401).json({ message: 'Your account could not be found.' })
+app.post('/api/students', requireAuth, requireStaff, async (request, response, next) => {
+  const { admissionNumber, name, trade, className } = request.body ?? {}
+  const attendanceDate = getAttendanceDate(request.body?.date)
+  if (
+    typeof admissionNumber !== 'string'
+    || admissionNumber.trim().length === 0
+    || admissionNumber.trim().length > 40
+    || typeof name !== 'string'
+    || name.trim().length === 0
+    || name.trim().length > 100
+    || typeof trade !== 'string'
+    || !allowedTrades.has(trade)
+    || typeof className !== 'string'
+    || className.trim().length === 0
+    || className.trim().length > 50
+    || !attendanceDate
+  ) {
+    response.status(400).json({
+      message: 'Enter a valid admission number, student name, trade, class, and attendance date.',
+    })
+    return
+  }
+
+  let connection
+  try {
+    connection = await pool.getConnection()
+    await connection.beginTransaction()
+    const [result] = await connection.execute(
+      `INSERT INTO students (admission_number, full_name, trade, class_name, created_by)
+      VALUES (?, ?, ?, ?, ?)`,
+      [
+        admissionNumber.trim(),
+        name.trim(),
+        trade,
+        className.trim(),
+        request.authUser.id,
+      ],
+    )
+    // Keep the new student's initial attendance row atomic with the roster record.
+    await connection.execute(
+      `INSERT INTO student_attendance (student_id, attendance_date, status, recorded_by)
+      VALUES (?, ?, 'unmarked', ?)`,
+      [result.insertId, attendanceDate, request.authUser.id],
+    )
+    await connection.commit()
+
+    response.status(201).json({
+      message: 'Student added successfully.',
+      student: {
+        id: result.insertId,
+        admissionNumber: admissionNumber.trim(),
+        name: name.trim(),
+        trade,
+        className: className.trim(),
+        attendanceStatus: 'unmarked',
+      },
+    })
+  } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback()
+      } catch (rollbackError) {
+        console.error('Could not roll back student creation:', rollbackError)
+      }
+    }
+
+    if (error.code === 'ER_DUP_ENTRY') {
+      response.status(409).json({ message: 'That admission number is already in use.' })
+    } else {
+      next(error)
+    }
+  } finally {
+    connection?.release()
+  }
+})
+
+app.get('/api/attendance/summary', requireAuth, requireStaff, async (request, response, next) => {
+  const attendanceDate = getAttendanceDate(request.query.date)
+  if (!attendanceDate) {
+    response.status(400).json({ message: 'Enter a valid attendance date.' })
+    return
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT
+        COUNT(s.id) AS total,
+        COALESCE(SUM(a.status = 'present'), 0) AS present,
+        COALESCE(SUM(a.status = 'absent'), 0) AS absent,
+        COALESCE(SUM(a.status = 'late'), 0) AS late,
+        COALESCE(SUM(a.status IS NULL OR a.status = 'unmarked'), 0) AS unmarked
+      FROM students s
+      LEFT JOIN student_attendance a
+        ON a.student_id = s.id AND a.attendance_date = ?`,
+      [attendanceDate],
+    )
+    response.json({ date: attendanceDate, summary: rows[0] })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/attendance', requireAuth, requireStaff, async (request, response, next) => {
+  const { studentId, status } = request.body ?? {}
+  const attendanceDate = getAttendanceDate(request.body?.date)
+  const parsedStudentId = Number(studentId)
+
+  if (
+    !Number.isSafeInteger(parsedStudentId)
+    || parsedStudentId < 1
+    || !['present', 'absent', 'late'].includes(status)
+    || !attendanceDate
+  ) {
+    response.status(400).json({ message: 'Enter a valid student, date, and attendance status.' })
+    return
+  }
+
+  try {
+    await pool.execute(
+      `INSERT INTO student_attendance (student_id, attendance_date, status, recorded_by)
+      VALUES (?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        status = VALUES(status),
+        recorded_by = VALUES(recorded_by),
+        updated_at = CURRENT_TIMESTAMP`,
+        [parsedStudentId, attendanceDate, status, request.authUser.id],
+    )
+
+    response.json({
+      message: 'Attendance saved.',
+      attendance: { studentId: parsedStudentId, date: attendanceDate, status },
+    })
+  } catch (error) {
+    if (error.code === 'ER_NO_REFERENCED_ROW_2') {
+      response.status(404).json({ message: 'Student not found.' })
       return
     }
 
-    response.json({ user: { name: user.user_name, email: user.user_email } })
-  } catch (error) {
     next(error)
   }
 })
