@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import bdcImage from '../assets/trade-bdc.jpg'
 import csaImage from '../assets/trade-csa.jpg'
@@ -6,83 +6,104 @@ import fboImage from '../assets/trade-fbo.jpg'
 import fashionImage from '../assets/trade-fashion.jpg'
 import softwareImage from '../assets/trade-software.jpg'
 
-const programs = [
-  { title: 'Building and Construction', shortTitle: 'BDC', path: '/bdc', image: bdcImage, color: 'mint' },
-  { title: 'Computer Systems and Architecture', shortTitle: 'CSA', path: '/csa', image: csaImage, color: 'blue' },
-  { title: 'Food and Beverage Operations', shortTitle: 'FBO', path: '/fbo', image: fboImage, color: 'orange' },
-  { title: 'Fashion Design', shortTitle: 'FD', path: '/fd', image: fashionImage, color: 'pink' },
-  { title: 'Software Development', shortTitle: 'Software', path: '/software', image: softwareImage, color: 'purple' },
+const trades = [
+  {
+    code: 'BDC',
+    name: 'Building and Construction',
+    path: '/bdc',
+    image: bdcImage,
+    description: 'Learn how buildings take shape, from planning and measuring to practical construction skills.',
+  },
+  {
+    code: 'CSA',
+    name: 'Computer Systems and Architecture',
+    path: '/csa',
+    image: csaImage,
+    description: 'Explore computer hardware, system components, and the technology behind digital devices.',
+  },
+  {
+    code: 'FBO',
+    name: 'Food and Beverage Operations',
+    path: '/fbo',
+    image: fboImage,
+    description: 'Build practical skills in food preparation, service, and hospitality operations.',
+  },
+  {
+    code: 'FD',
+    name: 'Fashion Design',
+    path: '/fd',
+    image: fashionImage,
+    description: 'Turn creative ideas into garments by exploring design, materials, and making techniques.',
+  },
+  {
+    code: 'SW',
+    value: 'Software',
+    name: 'Software Development',
+    path: '/software',
+    image: softwareImage,
+    description: 'Discover how to plan, build, and improve software for real-world needs.',
+  },
 ]
+const attendanceStatuses = ['present', 'absent', 'late']
 
-const studentTrades = ['BDC', 'CSA', 'FBO', 'FD', 'Software']
-
-function getLocalDate() {
+function todayLocal() {
   const now = new Date()
-  const offset = now.getTimezoneOffset() * 60000
-  return new Date(now.getTime() - offset).toISOString().slice(0, 10)
+  now.setMinutes(now.getMinutes() - now.getTimezoneOffset())
+  return now.toISOString().slice(0, 10)
 }
 
-async function loadManagementData(date) {
+async function readJson(response) {
+  const result = await response.json()
+  if (!response.ok) {
+    const error = new Error(result.message || 'The request could not be completed.')
+    error.status = response.status
+    throw error
+  }
+  return result
+}
+
+async function loadStudentRecords(date) {
   const query = `?date=${encodeURIComponent(date)}`
   const [studentsResponse, summaryResponse] = await Promise.all([
     fetch(`/api/students${query}`, { credentials: 'same-origin' }),
     fetch(`/api/attendance/summary${query}`, { credentials: 'same-origin' }),
   ])
   const [studentsResult, summaryResult] = await Promise.all([
-    studentsResponse.json(),
-    summaryResponse.json(),
+    readJson(studentsResponse),
+    readJson(summaryResponse),
   ])
-
-  if (!studentsResponse.ok) {
-    const error = new Error(studentsResult.message || 'Student records could not be loaded.')
-    error.status = studentsResponse.status
-    throw error
-  }
-  if (!summaryResponse.ok) {
-    const error = new Error(summaryResult.message || 'Attendance summary could not be loaded.')
-    error.status = summaryResponse.status
-    throw error
-  }
-
   return { students: studentsResult.students, summary: summaryResult.summary }
 }
 
 function Dashboard() {
   const navigate = useNavigate()
-  const managementRequestId = useRef(0)
   const [user, setUser] = useState(null)
+  const [students, setStudents] = useState([])
+  const [summary, setSummary] = useState(null)
+  const [date, setDate] = useState(todayLocal)
+  const [loading, setLoading] = useState(true)
+  const [recordsLoading, setRecordsLoading] = useState(false)
+  const [savingStudent, setSavingStudent] = useState(false)
+  const [editingStudent, setEditingStudent] = useState(null)
+  const [savingAttendance, setSavingAttendance] = useState(null)
+  const [signingOut, setSigningOut] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [signingOut, setSigningOut] = useState(false)
-  const [students, setStudents] = useState([])
-  const [attendanceSummary, setAttendanceSummary] = useState(null)
-  const [attendanceDate, setAttendanceDate] = useState(getLocalDate)
-  const [recordsLoading, setRecordsLoading] = useState(true)
-  const [studentSaving, setStudentSaving] = useState(false)
-  const [savingAttendanceId, setSavingAttendanceId] = useState(null)
 
   useEffect(() => {
     let active = true
 
     async function loadUser() {
       try {
-        const response = await fetch('/api/auth/me', { credentials: 'same-origin' })
-        const result = await response.json()
-
+        const result = await readJson(await fetch('/api/auth/me', { credentials: 'same-origin' }))
+        if (active) setUser(result.user)
+      } catch (requestError) {
         if (!active) return
-        if (response.status === 401) {
+        if (requestError.status === 401) {
           navigate('/login', { replace: true })
-          return
+        } else {
+          setError(requestError.message)
         }
-        if (!response.ok) {
-          setError(result.message || 'Your dashboard could not be loaded.')
-          return
-        }
-
-        setUser(result.user)
-      } catch {
-        if (active) setError('Could not connect to the server. Check your connection and try again.')
       } finally {
         if (active) setLoading(false)
       }
@@ -98,463 +119,314 @@ function Dashboard() {
     if (!user?.isStaff) return undefined
 
     let active = true
-    // Ignore older responses so an in-flight initial load cannot overwrite a new student or attendance update.
-    const requestId = ++managementRequestId.current
-
-    loadManagementData(attendanceDate)
-      .then(({ students: loadedStudents, summary }) => {
-        if (!active || requestId !== managementRequestId.current) return
-        setStudents(loadedStudents)
-        setAttendanceSummary(summary)
+    loadStudentRecords(date)
+      .then(({ students: nextStudents, summary: nextSummary }) => {
+        if (!active) return
+        setStudents(nextStudents)
+        setSummary(nextSummary)
         setError('')
       })
-      .catch((loadError) => {
-        if (!active || requestId !== managementRequestId.current) return
-        if (loadError.status === 401) {
+      .catch((requestError) => {
+        if (!active) return
+        if (requestError.status === 401) {
           navigate('/login', { replace: true })
-          return
+        } else {
+          setError(requestError.message)
         }
-        setError(loadError.message || 'Student records could not be loaded.')
       })
       .finally(() => {
-        if (active && requestId === managementRequestId.current) setRecordsLoading(false)
+        if (active) setRecordsLoading(false)
       })
 
     return () => {
       active = false
     }
-  }, [user?.isStaff, attendanceDate, navigate])
+  }, [date, navigate, user?.isStaff])
 
-  async function handleAddStudent(event) {
+  async function refreshRecords(forDate = date) {
+    const result = await loadStudentRecords(forDate)
+    setStudents(result.students)
+    setSummary(result.summary)
+  }
+
+  async function saveStudent(event) {
     event.preventDefault()
-    setError('')
-    setNotice('')
-    setStudentSaving(true)
-
-    // Keep the form reference before awaiting; React's event currentTarget is temporary.
     const form = event.currentTarget
-    const studentDate = attendanceDate
-    const formData = new FormData(event.currentTarget)
-    const student = {
-      ...Object.fromEntries(formData.entries()),
-      date: studentDate,
-    }
-
-    try {
-      const response = await fetch('/api/students', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify(student),
-      })
-      const result = await response.json()
-
-      if (!response.ok) {
-        if (response.status === 401) {
-          navigate('/login', { replace: true })
-          return
-        }
-        setError(result.message || 'The student could not be added.')
-        return
-      }
-
-      form.reset()
-      setRecordsLoading(false)
-      const requestId = ++managementRequestId.current
-      setStudents((current) => (
-        studentDate === attendanceDate
-          ? [...current.filter((item) => item.id !== result.student.id), result.student]
-            .sort((a, b) => a.name.localeCompare(b.name))
-          : current
-      ))
-      if (studentDate === attendanceDate) {
-        setAttendanceSummary((current) => current && ({
-          ...current,
-          total: Number(current.total) + 1,
-          unmarked: Number(current.unmarked) + 1,
-        }))
-      }
-      setNotice(`${result.student.name} was added to the student list.`)
-
-      try {
-        const { students: latestStudents, summary } = await loadManagementData(studentDate)
-        if (requestId === managementRequestId.current && studentDate === attendanceDate) {
-          setStudents(latestStudents)
-          setAttendanceSummary(summary)
-        }
-      } catch {
-        if (requestId === managementRequestId.current && studentDate === attendanceDate) {
-          setError('Student was saved, but the latest roster could not be refreshed.')
-        }
-      }
-    } catch {
-      setError('Could not connect to the server. The student was not added.')
-    } finally {
-      setStudentSaving(false)
-    }
-  }
-
-  async function handleAttendanceChange(studentId, status) {
+    const studentData = Object.fromEntries(new FormData(form).entries())
+    const isEditing = Boolean(editingStudent)
+    setSavingStudent(true)
     setError('')
     setNotice('')
-    setSavingAttendanceId(studentId)
-    const selectedDate = attendanceDate
 
     try {
-      const response = await fetch('/api/attendance', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ studentId, status, date: selectedDate }),
-      })
-      const result = await response.json()
-
-      if (!response.ok) {
-        if (response.status === 401) {
-          navigate('/login', { replace: true })
-          return
-        }
-        setError(result.message || 'Attendance could not be saved.')
-        return
-      }
-
-      if (selectedDate !== attendanceDate) return
-
-      const previousStatus = students.find((student) => student.id === studentId)?.attendanceStatus || 'unmarked'
-      setStudents((current) => current.map((student) => (
-        student.id === studentId ? { ...student, attendanceStatus: status } : student
-      )))
-      setAttendanceSummary((current) => {
-        if (!current) return current
-        const nextSummary = { ...current }
-        if (['present', 'absent', 'late', 'unmarked'].includes(previousStatus)) {
-          nextSummary[previousStatus] = Math.max(0, Number(nextSummary[previousStatus]) - 1)
-        }
-        nextSummary[status] = Number(nextSummary[status]) + 1
-        return nextSummary
-      })
-      setNotice('Attendance saved.')
-      const requestId = ++managementRequestId.current
+      const result = await readJson(await fetch(
+        isEditing ? `/api/students/${editingStudent.id}` : '/api/students',
+        {
+          method: isEditing ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ ...studentData, date }),
+        },
+      ))
+      form.reset()
+      setEditingStudent(null)
+      setNotice(result.message)
       try {
-        const { students: updatedStudents, summary } = await loadManagementData(selectedDate)
-        if (requestId === managementRequestId.current && selectedDate === attendanceDate) {
-          setStudents(updatedStudents)
-          setAttendanceSummary(summary)
-        }
+        await refreshRecords(date)
       } catch {
-        if (requestId === managementRequestId.current && selectedDate === attendanceDate) {
-          setError('Attendance was saved, but the latest records could not be refreshed.')
-        }
+        setError('Student was saved, but the roster could not be refreshed.')
       }
-    } catch {
-      setError('Could not save attendance. Check your connection and try again.')
+    } catch (requestError) {
+      if (requestError.status === 401) navigate('/login', { replace: true })
+      else setError(requestError.message || `Student could not be ${isEditing ? 'updated' : 'added'}.`)
     } finally {
-      setSavingAttendanceId(null)
+      setSavingStudent(false)
     }
   }
 
-  async function handleSignOut() {
+  async function saveAttendance(student, status) {
+    setSavingAttendance(student.id)
+    setError('')
+    setNotice('')
+
+    const hasRecord = Boolean(student.attendanceId)
+    const url = hasRecord ? `/api/attendance/${student.id}` : '/api/attendance'
+    const method = hasRecord ? 'PUT' : 'POST'
+    const body = hasRecord
+      ? { date, status }
+      : { studentId: student.id, date, status }
+
+    try {
+      const result = await readJson(await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify(body),
+      }))
+      await refreshRecords(date)
+      setNotice(result.message)
+    } catch (requestError) {
+      if (requestError.status === 401) navigate('/login', { replace: true })
+      else setError(requestError.message || 'Attendance could not be saved.')
+    } finally {
+      setSavingAttendance(null)
+    }
+  }
+
+  async function signOut() {
     setSigningOut(true)
     setError('')
-
     try {
-      const response = await fetch('/api/auth/logout', {
+      await readJson(await fetch('/api/auth/logout', {
         method: 'POST',
         credentials: 'same-origin',
-      })
-      const result = await response.json()
-
-      if (!response.ok) {
-        setError(result.message || 'You could not be signed out. Please try again.')
-        return
-      }
-
+      }))
       navigate('/login', { replace: true })
-    } catch {
-      setError('Could not connect to the server. You are still signed in.')
+    } catch (requestError) {
+      setError(requestError.message || 'Could not sign out.')
     } finally {
       setSigningOut(false)
     }
   }
 
   if (loading) {
-    return <section className="dashboard-state" role="status">Loading your dashboard…</section>
+    return <section className="portal-state" role="status">Loading your dashboard…</section>
   }
 
   if (!user) {
     return (
-      <section className="dashboard-state">
-        <p className="dashboard-state-error" role="alert">{error || 'Your dashboard could not be loaded.'}</p>
-        <button className="button button-primary" type="button" onClick={() => window.location.reload()}>
-          Try again
-        </button>
+      <section className="portal-state">
+        <p role="alert">{error || 'Your account could not be loaded.'}</p>
+        <Link className="button button-primary" to="/login">Return to sign in</Link>
       </section>
     )
   }
 
   const firstName = user.name.trim().split(/\s+/)[0]
-  const initials = user.name
-    .trim()
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((part) => part[0])
-    .join('')
-    .toUpperCase()
+  const initials = user.name.trim().split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase()
 
   return (
-    <div className="dashboard-page">
-      <aside className="dashboard-sidebar">
-        <Link className="dashboard-brand" to="/" aria-label="Mizero TSS home">
+    <div className="portal">
+      <aside className="portal-sidebar">
+        <Link className="brand portal-brand" to="/">
           <span className="brand-mark">M</span>
-          <span className="brand-copy">
-            <strong>MIZERO TSS</strong>
-            <small>Student portal</small>
-          </span>
+          <span className="brand-copy"><strong>MIZERO TSS</strong><small>Student portal</small></span>
         </Link>
-
-        <span className="dashboard-nav-label">{user.isStaff ? 'SCHOOL MANAGEMENT' : 'YOUR SPACE'}</span>
-        <nav className="dashboard-nav" aria-label="Dashboard navigation">
-          <a className="dashboard-nav-link is-current" href="#overview" aria-current="page">
-            <span aria-hidden="true">⌂</span> Overview
-          </a>
-          <a className="dashboard-nav-link" href="#programs">
-            <span aria-hidden="true">▦</span> Explore programs
-          </a>
-          <a className="dashboard-nav-link" href="#next-steps">
-            <span aria-hidden="true">✦</span> Getting started
-          </a>
-          {user.isStaff && (
-            <a className="dashboard-nav-link" href="#student-management">
-              <span aria-hidden="true">＋</span> Students & attendance
-            </a>
-          )}
+        <nav className="portal-nav" aria-label="Dashboard">
+          <a className="portal-nav-active" href="#overview">Overview</a>
+          {!user.isStaff && <a href="#programs">Explore trades</a>}
+          {user.isStaff && <a href="#student-management">Students & attendance</a>}
+          <a href="/#trades">Explore programs</a>
         </nav>
-
-        <div className="dashboard-sidebar-note">
-          <span className="dashboard-note-icon" aria-hidden="true">✳</span>
-          <strong>Your future starts with a first step.</strong>
-          <p>Discover the skills and trade that feel right for you.</p>
-          <a href="#programs">Explore pathways <span aria-hidden="true">→</span></a>
+        <div className="portal-sidebar-note">
+          <span>✳</span>
+          <strong>Skills for today.<br />Hope for tomorrow.</strong>
+          <p>Learning today. Leading tomorrow.</p>
         </div>
-
-        <Link className="dashboard-back-link" to="/">← Back to school site</Link>
+        <Link className="portal-back" to="/">← Back to school site</Link>
       </aside>
 
-      <div className="dashboard-content" id="overview">
-        <header className="dashboard-topbar">
+      <main className="portal-main" id="overview">
+        <header className="portal-topbar">
           <div>
-            <span className="dashboard-breadcrumb">STUDENT PORTAL <span>/</span> OVERVIEW</span>
-            <p>Welcome to your learning space</p>
+            <span className="portal-overline">MIZERO TSS · {user.isStaff ? 'STAFF PORTAL' : 'STUDENT PORTAL'}</span>
+            <p>Your learning space</p>
           </div>
-          <div className="dashboard-account">
-            <span className="dashboard-avatar" aria-hidden="true">{initials}</span>
-            <span className="dashboard-account-name">{user.name}</span>
-            <button type="button" className="dashboard-signout" onClick={handleSignOut} disabled={signingOut}>
+          <div className="portal-profile">
+            <span className="portal-avatar" aria-hidden="true">{initials}</span>
+            <span>{user.name}</span>
+            <button type="button" onClick={signOut} disabled={signingOut}>
               {signingOut ? 'Signing out…' : 'Sign out'}
             </button>
           </div>
         </header>
 
-        {error && <p className="dashboard-feedback" role="alert">{error}</p>}
-        {notice && <p className="dashboard-notice" role="status">{notice}</p>}
+        {error && <p className="portal-message portal-error" role="alert">{error}</p>}
+        {notice && <p className="portal-message portal-success" role="status">{notice}</p>}
 
-        <section className="dashboard-welcome">
-          <div className="dashboard-welcome-copy">
-            <span className="dashboard-welcome-label"><span /> YOUR MIZERO JOURNEY</span>
-            <h1>Welcome, {firstName}.</h1>
-            <p>Explore practical pathways, discover what inspires you, and start shaping what comes next.</p>
-            <a className="dashboard-welcome-button" href="#programs">Explore our programs <span aria-hidden="true">↗</span></a>
-          </div>
-          <div className="dashboard-welcome-art" aria-hidden="true">
-            <span className="welcome-orbit orbit-one" />
-            <span className="welcome-orbit orbit-two" />
-            <span className="welcome-spark">✳</span>
-            <span className="welcome-monogram">M</span>
-          </div>
-          <span className="dashboard-welcome-caption">LEARN BY DOING · GROW WITH PURPOSE</span>
+        <section className="portal-hero">
+          <span className="portal-overline">YOUR MIZERO JOURNEY</span>
+          <h1>Welcome, {firstName}.</h1>
+          <p>Explore practical pathways and start shaping what comes next.</p>
+          <a className="portal-hero-link" href={user.isStaff ? '#student-management' : '#programs'}>
+            {user.isStaff ? 'Manage students' : 'Explore programs'} <span aria-hidden="true">↗</span>
+          </a>
+          <span className="portal-hero-mark" aria-hidden="true">M</span>
         </section>
 
-        <section className="dashboard-facts" aria-label="School information">
-          <article className="dashboard-fact">
-            <span className="dashboard-fact-icon fact-green" aria-hidden="true">▦</span>
-            <div><strong>05</strong><span>Technical pathways</span></div>
-          </article>
-          <article className="dashboard-fact">
-            <span className="dashboard-fact-icon fact-yellow" aria-hidden="true">⌖</span>
-            <div><strong>Rusizi</strong><span>Western Province, Rwanda</span></div>
-          </article>
-          <article className="dashboard-fact">
-            <span className="dashboard-fact-icon fact-blue" aria-hidden="true">✦</span>
-            <div><strong>Your next step</strong><span>Find a program that inspires you</span></div>
-          </article>
-        </section>
-
-        {user.isStaff && (
-          <section className="staff-management" id="student-management">
-            <div className="dashboard-section-heading staff-section-heading">
-              <div>
-                <span className="dashboard-section-eyebrow">STAFF WORKSPACE</span>
-                <h2>Students & attendance</h2>
-              </div>
-              <label className="attendance-date-label">
-                Attendance date
+        {user.isStaff ? (
+          <section className="portal-management" id="student-management">
+            <div className="portal-heading">
+              <div><span className="portal-overline">STAFF WORKSPACE</span><h2>Students & attendance</h2></div>
+              <label className="portal-date">Attendance date
                 <input
                   type="date"
-                  value={attendanceDate}
-                  disabled={studentSaving || savingAttendanceId !== null}
+                  value={date}
                   onChange={(event) => {
                     setRecordsLoading(true)
-                    setAttendanceDate(event.target.value)
+                    setDate(event.target.value)
                   }}
                 />
               </label>
             </div>
 
-            <div className="attendance-summary" aria-label="Attendance summary">
-              <article><span>Total students</span><strong>{attendanceSummary ? attendanceSummary.total : '—'}</strong></article>
-              <article><span>Present</span><strong>{attendanceSummary ? attendanceSummary.present : '—'}</strong></article>
-              <article><span>Absent</span><strong>{attendanceSummary ? attendanceSummary.absent : '—'}</strong></article>
-              <article><span>Late</span><strong>{attendanceSummary ? attendanceSummary.late : '—'}</strong></article>
-              <article><span>Not marked</span><strong>{attendanceSummary ? attendanceSummary.unmarked : '—'}</strong></article>
+            <div className="portal-summary" aria-label="Attendance summary">
+              <article><span>Total students</span><strong>{summary?.total ?? '—'}</strong></article>
+              <article><span>Present</span><strong>{summary?.present ?? '—'}</strong></article>
+              <article><span>Absent</span><strong>{summary?.absent ?? '—'}</strong></article>
+              <article><span>Late</span><strong>{summary?.late ?? '—'}</strong></article>
+              <article><span>Not marked</span><strong>{summary?.unmarked ?? '—'}</strong></article>
             </div>
 
-            <div className="staff-management-grid">
-              <section className="staff-panel">
-                <div className="staff-panel-heading">
-                  <span className="dashboard-section-eyebrow">STUDENT RECORDS</span>
-                  <h3>Add a student</h3>
-                  <p>Save a student to the school database.</p>
-                </div>
-                <form className="student-form" onSubmit={handleAddStudent}>
-                  <label>
-                    Admission number
-                    <input name="admissionNumber" maxLength="40" placeholder="e.g. MTS-2026-001" required />
-                  </label>
-                  <label>
-                    Student full name
-                    <input name="name" maxLength="100" autoComplete="name" placeholder="Enter full name" required />
-                  </label>
-                  <label>
-                    Trade
-                    <select name="trade" required defaultValue="">
-                      <option value="" disabled>Select a trade</option>
-                      {studentTrades.map((trade) => <option value={trade} key={trade}>{trade}</option>)}
-                    </select>
-                  </label>
-                  <label>
-                    Class
-                    <input name="className" maxLength="50" placeholder="e.g. Level 3" required />
-                  </label>
-                  <button className="button button-primary student-submit" type="submit" disabled={studentSaving}>
-                    {studentSaving ? 'Saving student…' : 'Add student'} {!studentSaving && <span aria-hidden="true">＋</span>}
+            <div className="portal-columns">
+              <section className="portal-card">
+                <span className="portal-overline">STUDENT RECORDS</span>
+                <h3>{editingStudent ? 'Edit student' : 'Add a student'}</h3>
+                <form className="portal-form" key={editingStudent?.id ?? 'new-student'} onSubmit={saveStudent}>
+                  <label>Admission number<input name="admissionNumber" maxLength="40" defaultValue={editingStudent?.admissionNumber || ''} required /></label>
+                  <label>Student full name<input name="name" maxLength="100" defaultValue={editingStudent?.name || ''} required /></label>
+                  <label>Trade<select name="trade" defaultValue={editingStudent?.trade || ''} required>
+                    <option value="" disabled>Select a trade</option>
+                    {trades.map((trade) => <option key={trade.code} value={trade.value || trade.code}>{trade.code}</option>)}
+                  </select></label>
+                  <label>Class<input name="className" maxLength="50" placeholder="e.g. Level 3" defaultValue={editingStudent?.className || ''} required /></label>
+                  <button className="button button-primary" type="submit" disabled={savingStudent}>
+                    {savingStudent ? 'Saving…' : editingStudent ? 'Save changes' : 'Add student'}
                   </button>
+                  {editingStudent && (
+                    <button className="portal-cancel-edit" type="button" onClick={() => setEditingStudent(null)}>
+                      Cancel editing
+                    </button>
+                  )}
                 </form>
               </section>
 
-              <section className="staff-panel staff-records-panel">
-                <div className="staff-panel-heading staff-records-heading">
-                  <div>
-                    <span className="dashboard-section-eyebrow">SCHOOL ROSTER</span>
-                    <h3>Student list</h3>
-                  </div>
-                  <span className="student-count">{students.length} {students.length === 1 ? 'student' : 'students'}</span>
+              <section className="portal-card portal-roster">
+                <div className="portal-roster-heading">
+                  <div><span className="portal-overline">SCHOOL ROSTER</span><h3>Student list</h3></div>
+                  <span>{students.length} {students.length === 1 ? 'student' : 'students'}</span>
                 </div>
-                {recordsLoading ? (
-                  <p className="student-list-state" role="status">Loading student records…</p>
-                ) : students.length === 0 ? (
-                  <p className="student-list-state">No students have been added yet. Add the first student using the form.</p>
-                ) : (
-                  <div className="student-table-wrap">
-                    <table className="student-table">
-                      <thead>
-                        <tr>
-                          <th>Student</th>
-                          <th>Admission no.</th>
-                          <th>Trade / class</th>
-                          <th>Attendance</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {students.map((student) => (
-                          <tr key={student.id}>
-                            <td data-label="Student"><strong>{student.name}</strong></td>
-                            <td data-label="Admission no.">{student.admissionNumber}</td>
-                            <td data-label="Trade / class">{student.trade} · {student.className}</td>
-                            <td data-label="Attendance">
-                              <select
-                                aria-label={`Attendance for ${student.name}`}
-                                className={`attendance-select${student.attendanceStatus ? ` status-${student.attendanceStatus}` : ''}`}
-                                value={student.attendanceStatus || ''}
-                                onChange={(event) => handleAttendanceChange(student.id, event.target.value)}
-                                disabled={savingAttendanceId !== null}
-                              >
-                                <option value="unmarked" disabled>
-                                  {savingAttendanceId === student.id ? 'Saving…' : 'Not marked'}
-                                </option>
-                                <option value="present">Present</option>
-                                <option value="absent">Absent</option>
-                                <option value="late">Late</option>
-                              </select>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                {recordsLoading ? <p className="portal-empty" role="status">Loading records…</p>
+                  : students.length === 0 ? <p className="portal-empty">No students added yet.</p>
+                    : (
+                      <div className="portal-table-scroll">
+                        <table className="portal-table">
+                          <thead><tr><th>Student</th><th>Admission no.</th><th>Trade / class</th><th>Attendance</th><th>Actions</th></tr></thead>
+                          <tbody>{students.map((student) => (
+                            <tr key={student.id}>
+                              <td data-label="Student"><strong>{student.name}</strong></td>
+                              <td data-label="Admission no.">{student.admissionNumber}</td>
+                              <td data-label="Trade / class">{student.trade} · {student.className}</td>
+                              <td data-label="Attendance">
+                                <select
+                                  aria-label={`Attendance for ${student.name}`}
+                                  value={student.attendanceStatus || 'unmarked'}
+                                  disabled={savingAttendance !== null}
+                                  onChange={(event) => saveAttendance(student, event.target.value)}
+                                >
+                                  <option value="unmarked" disabled>
+                                    {savingAttendance === student.id ? 'Saving…' : 'Not marked'}
+                                  </option>
+                                  {attendanceStatuses.map((status) => (
+                                    <option key={status} value={status}>{status[0].toUpperCase() + status.slice(1)}</option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td data-label="Actions">
+                                <button
+                                  className="portal-edit-button"
+                                  type="button"
+                                  onClick={() => setEditingStudent(student)}
+                                >
+                                  Edit
+                                </button>
+                              </td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
+                    )}
               </section>
+            </div>
+          </section>
+        ) : (
+          <section className="portal-trades" id="programs">
+            <div className="portal-heading">
+              <div>
+                <span className="portal-overline">FIND WHAT INSPIRES YOU</span>
+                <h2>Explore our five trades</h2>
+              </div>
+              <a className="portal-all-trades" href="/#trades">View on school site ↗</a>
+            </div>
+            <p className="portal-trades-intro">
+              Each trade combines practical learning with skills for your next step. Browse the introductions,
+              then open a program to learn more.
+            </p>
+            <div className="portal-trade-grid">
+              {trades.map((trade) => (
+                <article className="portal-trade-card" key={trade.code}>
+                  <img src={trade.image} alt="" loading="lazy" />
+                  <div className="portal-trade-copy">
+                    <span>{trade.code}</span>
+                    <h3>{trade.name}</h3>
+                    <p>{trade.description}</p>
+                    <Link to={trade.path}>Explore this trade <span aria-hidden="true">↗</span></Link>
+                  </div>
+                </article>
+              ))}
+            </div>
+            <div className="portal-help">
+              <div><strong>Not sure where to start?</strong><p>Talk to the school and we’ll help you explore your options.</p></div>
+              <a href="mailto:info@mizerotss.rw">Contact Mizero TSS ↗</a>
             </div>
           </section>
         )}
 
-        <div className="dashboard-section-heading" id="programs">
-          <div>
-            <span className="dashboard-section-eyebrow">FIND YOUR DIRECTION</span>
-            <h2>Explore our programs</h2>
-          </div>
-          <Link to="/">Learn about Mizero <span aria-hidden="true">↗</span></Link>
-        </div>
-
-        <div className="dashboard-body-grid">
-          <section className="dashboard-programs" aria-label="Technical programs">
-            {programs.map((program, index) => (
-              <Link className="dashboard-program-card" to={program.path} key={program.path}>
-                <img className={`dashboard-program-image program-${program.color}`} src={program.image} alt="" />
-                <span className="dashboard-program-number">0{index + 1}</span>
-                <span className="dashboard-program-copy">
-                  <strong>{program.title}</strong>
-                  <small>{program.shortTitle}</small>
-                </span>
-                <span className="dashboard-program-arrow" aria-hidden="true">↗</span>
-              </Link>
-            ))}
-          </section>
-
-          <aside className="dashboard-side-column">
-            <section className="dashboard-next-card" id="next-steps">
-              <span className="dashboard-section-eyebrow">A GOOD PLACE TO START</span>
-              <h2>Your next steps</h2>
-              <ol className="dashboard-steps">
-                <li><span>01</span><div><strong>Explore the trades</strong><p>See what each program is all about.</p></div></li>
-                <li><span>02</span><div><strong>Find what interests you</strong><p>Think about the skills you want to build.</p></div></li>
-                <li><span>03</span><div><strong>Talk with our school</strong><p>We’re here to help you choose your path.</p></div></li>
-              </ol>
-              <a className="dashboard-contact-link" href="mailto:info@mizerotss.rw">Get in touch <span aria-hidden="true">↗</span></a>
-            </section>
-
-            <section className="dashboard-help-card">
-              <span className="dashboard-help-icon" aria-hidden="true">?</span>
-              <div><strong>Need a hand?</strong><p>Reach out and we’ll be happy to help.</p></div>
-              <a href="mailto:info@mizerotss.rw" aria-label="Email Mizero TSS">→</a>
-            </section>
-          </aside>
-        </div>
-
-        <footer className="dashboard-footer">
+        <footer className="portal-footer">
           <span>© {new Date().getFullYear()} Mizero Technical Secondary School</span>
-          <span>Learning today. Leading tomorrow.</span>
+          <span>Rusizi · Western Province · Rwanda</span>
         </footer>
-      </div>
+      </main>
     </div>
   )
 }

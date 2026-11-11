@@ -64,6 +64,8 @@ const authRateLimit = rateLimit({
   legacyHeaders: false,
   message: { message: 'Too many attempts. Please try again later.' },
 })
+const allowedTrades = new Set(['BDC', 'CSA', 'FBO', 'FD', 'Software'])
+const attendanceStatuses = new Set(['present', 'absent', 'late'])
 
 function createSession(user, response) {
   const token = jwt.sign(
@@ -103,24 +105,19 @@ function validateCredentials({ username, email, password }, includeUsername = fa
   return null
 }
 
-function getAttendanceDate(value) {
-  const date = value ?? new Date().toISOString().slice(0, 10)
-  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return null
+function isValidAttendanceDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false
   }
 
-  const [year, month, day] = date.split('-').map(Number)
-  const parsedDate = new Date(Date.UTC(year, month - 1, day))
-  if (
-    parsedDate.getUTCFullYear() !== year
-    || parsedDate.getUTCMonth() !== month - 1
-    || parsedDate.getUTCDate() !== day
-  ) return null
-
-  return date
+  const [year, month, day] = value.split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day))
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day
 }
 
-async function requireAuth(request, response, next) {
+async function requireStaff(request, response, next) {
   const token = request.cookies[sessionCookie]
   if (!token) {
     response.status(401).json({ message: 'You are not signed in.' })
@@ -143,34 +140,24 @@ async function requireAuth(request, response, next) {
 
   try {
     const [users] = await pool.execute(
-      'SELECT id, user_name, user_email, role FROM signup WHERE id = ? LIMIT 1',
+      'SELECT id, role FROM signup WHERE id = ? LIMIT 1',
       [payload.sub],
     )
-    const user = users[0]
-
-    if (!user) {
-      response.clearCookie(sessionCookie, clearCookieOptions)
+    if (!users[0]) {
       response.status(401).json({ message: 'Your account could not be found.' })
       return
     }
+    if (users[0].role !== 'staff') {
+      response.status(403).json({ message: 'Staff access is required.' })
+      return
+    }
 
-    request.authUser = user
+    request.authUserId = users[0].id
     next()
   } catch (error) {
     next(error)
   }
 }
-
-function requireStaff(request, response, next) {
-  if (request.authUser.role !== 'staff') {
-    response.status(403).json({ message: 'Staff access is required to manage student records.' })
-    return
-  }
-
-  next()
-}
-
-const allowedTrades = new Set(['BDC', 'CSA', 'FBO', 'FD', 'Software'])
 
 app.post('/api/auth/register', authRateLimit, async (request, response, next) => {
   const { username, email, password } = request.body ?? {}
@@ -242,19 +229,55 @@ app.post('/api/auth/login', authRateLimit, async (request, response, next) => {
   }
 })
 
-app.get('/api/auth/me', requireAuth, (request, response) => {
-  response.json({
-    user: {
-      name: request.authUser.user_name,
-      email: request.authUser.user_email,
-      isStaff: request.authUser.role === 'staff',
-    },
-  })
+app.get('/api/auth/me', async (request, response, next) => {
+  const token = request.cookies[sessionCookie]
+  if (!token) {
+    response.status(401).json({ message: 'You are not signed in.' })
+    return
+  }
+
+  let payload
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET)
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      response.clearCookie(sessionCookie, clearCookieOptions)
+      response.status(401).json({ message: 'Your session has expired. Please sign in again.' })
+      return
+    }
+
+    next(error)
+    return
+  }
+
+  try {
+    const [users] = await pool.execute(
+      'SELECT user_name, user_email, role FROM signup WHERE id = ? LIMIT 1',
+      [payload.sub],
+    )
+    const user = users[0]
+
+    if (!user) {
+      response.clearCookie(sessionCookie, clearCookieOptions)
+      response.status(401).json({ message: 'Your account could not be found.' })
+      return
+    }
+
+    response.json({
+      user: {
+        name: user.user_name,
+        email: user.user_email,
+        isStaff: user.role === 'staff',
+      },
+    })
+  } catch (error) {
+    next(error)
+  }
 })
 
-app.get('/api/students', requireAuth, requireStaff, async (request, response, next) => {
-  const attendanceDate = getAttendanceDate(request.query.date)
-  if (!attendanceDate) {
+app.get('/api/students', requireStaff, async (request, response, next) => {
+  const date = request.query.date
+  if (!isValidAttendanceDate(date)) {
     response.status(400).json({ message: 'Enter a valid attendance date.' })
     return
   }
@@ -262,13 +285,13 @@ app.get('/api/students', requireAuth, requireStaff, async (request, response, ne
   try {
     const [students] = await pool.execute(
       `SELECT s.id, s.admission_number AS admissionNumber, s.full_name AS name,
-        s.trade, s.class_name AS className,
+        s.trade, s.class_name AS className, a.id AS attendanceId,
         COALESCE(a.status, 'unmarked') AS attendanceStatus
       FROM students s
       LEFT JOIN student_attendance a
         ON a.student_id = s.id AND a.attendance_date = ?
       ORDER BY s.full_name, s.admission_number`,
-      [attendanceDate],
+      [date],
     )
     response.json({ students })
   } catch (error) {
@@ -276,25 +299,24 @@ app.get('/api/students', requireAuth, requireStaff, async (request, response, ne
   }
 })
 
-app.post('/api/students', requireAuth, requireStaff, async (request, response, next) => {
-  const { admissionNumber, name, trade, className } = request.body ?? {}
-  const attendanceDate = getAttendanceDate(request.body?.date)
+app.post('/api/students', requireStaff, async (request, response, next) => {
+  const { admissionNumber, name, trade, className, date } = request.body ?? {}
   if (
     typeof admissionNumber !== 'string'
-    || admissionNumber.trim().length === 0
+    || !admissionNumber.trim()
     || admissionNumber.trim().length > 40
     || typeof name !== 'string'
-    || name.trim().length === 0
+    || !name.trim()
     || name.trim().length > 100
     || typeof trade !== 'string'
     || !allowedTrades.has(trade)
     || typeof className !== 'string'
-    || className.trim().length === 0
+    || !className.trim()
     || className.trim().length > 50
-    || !attendanceDate
+    || !isValidAttendanceDate(date)
   ) {
     response.status(400).json({
-      message: 'Enter a valid admission number, student name, trade, class, and attendance date.',
+      message: 'Enter a valid admission number, student name, trade, class, and date.',
     })
     return
   }
@@ -303,33 +325,28 @@ app.post('/api/students', requireAuth, requireStaff, async (request, response, n
   try {
     connection = await pool.getConnection()
     await connection.beginTransaction()
-    const [result] = await connection.execute(
+
+    const [studentResult] = await connection.execute(
       `INSERT INTO students (admission_number, full_name, trade, class_name, created_by)
       VALUES (?, ?, ?, ?, ?)`,
-      [
-        admissionNumber.trim(),
-        name.trim(),
-        trade,
-        className.trim(),
-        request.authUser.id,
-      ],
+      [admissionNumber.trim(), name.trim(), trade, className.trim(), request.authUserId],
     )
-    // Keep the new student's initial attendance row atomic with the roster record.
-    await connection.execute(
+    const [attendanceResult] = await connection.execute(
       `INSERT INTO student_attendance (student_id, attendance_date, status, recorded_by)
       VALUES (?, ?, 'unmarked', ?)`,
-      [result.insertId, attendanceDate, request.authUser.id],
+      [studentResult.insertId, date, request.authUserId],
     )
-    await connection.commit()
 
+    await connection.commit()
     response.status(201).json({
       message: 'Student added successfully.',
       student: {
-        id: result.insertId,
+        id: studentResult.insertId,
         admissionNumber: admissionNumber.trim(),
         name: name.trim(),
         trade,
         className: className.trim(),
+        attendanceId: attendanceResult.insertId,
         attendanceStatus: 'unmarked',
       },
     })
@@ -352,9 +369,69 @@ app.post('/api/students', requireAuth, requireStaff, async (request, response, n
   }
 })
 
-app.get('/api/attendance/summary', requireAuth, requireStaff, async (request, response, next) => {
-  const attendanceDate = getAttendanceDate(request.query.date)
-  if (!attendanceDate) {
+app.put('/api/students/:studentId', requireStaff, async (request, response, next) => {
+  const studentId = Number(request.params.studentId)
+  const { admissionNumber, name, trade, className } = request.body ?? {}
+  if (
+    !Number.isSafeInteger(studentId)
+    || studentId < 1
+    || typeof admissionNumber !== 'string'
+    || !admissionNumber.trim()
+    || admissionNumber.trim().length > 40
+    || typeof name !== 'string'
+    || !name.trim()
+    || name.trim().length > 100
+    || typeof trade !== 'string'
+    || !allowedTrades.has(trade)
+    || typeof className !== 'string'
+    || !className.trim()
+    || className.trim().length > 50
+  ) {
+    response.status(400).json({ message: 'Enter valid student details.' })
+    return
+  }
+
+  try {
+    const [result] = await pool.execute(
+      `UPDATE students
+      SET admission_number = ?, full_name = ?, trade = ?, class_name = ?
+      WHERE id = ?`,
+      [admissionNumber.trim(), name.trim(), trade, className.trim(), studentId],
+    )
+
+    if (result.affectedRows === 0) {
+      const [students] = await pool.execute(
+        'SELECT id FROM students WHERE id = ? LIMIT 1',
+        [studentId],
+      )
+      if (students.length === 0) {
+        response.status(404).json({ message: 'Student not found.' })
+        return
+      }
+    }
+
+    response.json({
+      message: 'Student details updated.',
+      student: {
+        id: studentId,
+        admissionNumber: admissionNumber.trim(),
+        name: name.trim(),
+        trade,
+        className: className.trim(),
+      },
+    })
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') {
+      response.status(409).json({ message: 'That admission number is already in use.' })
+    } else {
+      next(error)
+    }
+  }
+})
+
+app.get('/api/attendance/summary', requireStaff, async (request, response, next) => {
+  const date = request.query.date
+  if (!isValidAttendanceDate(date)) {
     response.status(400).json({ message: 'Enter a valid attendance date.' })
     return
   }
@@ -370,50 +447,84 @@ app.get('/api/attendance/summary', requireAuth, requireStaff, async (request, re
       FROM students s
       LEFT JOIN student_attendance a
         ON a.student_id = s.id AND a.attendance_date = ?`,
-      [attendanceDate],
+      [date],
     )
-    response.json({ date: attendanceDate, summary: rows[0] })
+    response.json({ date, summary: rows[0] })
   } catch (error) {
     next(error)
   }
 })
 
-app.post('/api/attendance', requireAuth, requireStaff, async (request, response, next) => {
-  const { studentId, status } = request.body ?? {}
-  const attendanceDate = getAttendanceDate(request.body?.date)
+app.post('/api/attendance', requireStaff, async (request, response, next) => {
+  const { studentId, date, status } = request.body ?? {}
   const parsedStudentId = Number(studentId)
-
   if (
     !Number.isSafeInteger(parsedStudentId)
     || parsedStudentId < 1
-    || !['present', 'absent', 'late'].includes(status)
-    || !attendanceDate
+    || !isValidAttendanceDate(date)
+    || !attendanceStatuses.has(status)
   ) {
     response.status(400).json({ message: 'Enter a valid student, date, and attendance status.' })
     return
   }
 
   try {
-    await pool.execute(
+    const [result] = await pool.execute(
       `INSERT INTO student_attendance (student_id, attendance_date, status, recorded_by)
-      VALUES (?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        status = VALUES(status),
-        recorded_by = VALUES(recorded_by),
-        updated_at = CURRENT_TIMESTAMP`,
-        [parsedStudentId, attendanceDate, status, request.authUser.id],
+      VALUES (?, ?, ?, ?)`,
+      [parsedStudentId, date, status, request.authUserId],
     )
-
-    response.json({
-      message: 'Attendance saved.',
-      attendance: { studentId: parsedStudentId, date: attendanceDate, status },
+    response.status(201).json({
+      message: 'Attendance recorded.',
+      attendance: { id: result.insertId, studentId: parsedStudentId, date, status },
     })
   } catch (error) {
     if (error.code === 'ER_NO_REFERENCED_ROW_2') {
       response.status(404).json({ message: 'Student not found.' })
-      return
+    } else if (error.code === 'ER_DUP_ENTRY') {
+      response.status(409).json({ message: 'Attendance already exists for this student and date.' })
+    } else {
+      next(error)
+    }
+  }
+})
+
+app.put('/api/attendance/:studentId', requireStaff, async (request, response, next) => {
+  const studentId = Number(request.params.studentId)
+  const { date, status } = request.body ?? {}
+  if (
+    !Number.isSafeInteger(studentId)
+    || studentId < 1
+    || !isValidAttendanceDate(date)
+    || !attendanceStatuses.has(status)
+  ) {
+    response.status(400).json({ message: 'Enter a valid student, date, and attendance status.' })
+    return
+  }
+
+  try {
+    const [result] = await pool.execute(
+      `UPDATE student_attendance
+      SET status = ?, recorded_by = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE student_id = ? AND attendance_date = ?`,
+      [status, request.authUserId, studentId, date],
+    )
+
+    if (result.affectedRows === 0) {
+      const [records] = await pool.execute(
+        `SELECT id FROM student_attendance
+        WHERE student_id = ? AND attendance_date = ?
+        LIMIT 1`,
+        [studentId, date],
+      )
+      if (records.length === 0) {
+        response.status(404).json({ message: 'Attendance record not found for this student and date.' })
+        return
+      }
     }
 
+    response.json({ message: 'Attendance updated.', attendance: { studentId, date, status } })
+  } catch (error) {
     next(error)
   }
 })

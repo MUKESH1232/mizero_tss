@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS student_attendance (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   student_id BIGINT UNSIGNED NOT NULL,
   attendance_date DATE NOT NULL,
-  status ENUM('present', 'absent', 'late') NOT NULL,
+  status ENUM('unmarked', 'present', 'absent', 'late') NOT NULL DEFAULT 'unmarked',
   recorded_by BIGINT UNSIGNED NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

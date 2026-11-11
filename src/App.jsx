@@ -12,8 +12,7 @@ import Signup from './component/signup.jsx'
 import Software from './component/software.jsx'
 
 function AppContent() {
-  const { pathname } = useLocation()
-  const isDashboard = pathname === '/dashboard'
+  const isDashboard = useLocation().pathname === '/dashboard'
 
   return (
     <div className="site-shell">
