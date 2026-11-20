@@ -105,16 +105,11 @@ function validateCredentials({ username, email, password }, includeUsername = fa
   return null
 }
 
-function isValidAttendanceDate(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    return false
-  }
-
-  const [year, month, day] = value.split('-').map(Number)
-  const date = new Date(Date.UTC(year, month - 1, day))
-  return date.getUTCFullYear() === year
-    && date.getUTCMonth() === month - 1
-    && date.getUTCDate() === day
+async function getSystemAttendanceDate(database = pool) {
+  const [rows] = await database.query(
+    "SELECT DATE_FORMAT(CURRENT_DATE(), '%Y-%m-%d') AS attendanceDate",
+  )
+  return rows[0].attendanceDate
 }
 
 async function requireStaff(request, response, next) {
@@ -276,31 +271,52 @@ app.get('/api/auth/me', async (request, response, next) => {
 })
 
 app.get('/api/students', requireStaff, async (request, response, next) => {
-  const date = request.query.date
-  if (!isValidAttendanceDate(date)) {
-    response.status(400).json({ message: 'Enter a valid attendance date.' })
+  if (request.query.date !== undefined) {
+    response.status(400).json({ message: 'Attendance date is set by the system.' })
     return
   }
 
   try {
+    const attendanceDate = await getSystemAttendanceDate()
     const [students] = await pool.execute(
       `SELECT s.id, s.admission_number AS admissionNumber, s.full_name AS name,
         s.trade, s.class_name AS className, a.id AS attendanceId,
-        COALESCE(a.status, 'unmarked') AS attendanceStatus
+        COALESCE(a.status, 'unmarked') AS attendanceStatus,
+        CASE
+          WHEN a.status IS NULL OR a.status = 'unmarked' THEN NULL
+          ELSE DATE_FORMAT(a.updated_at, '%Y-%m-%d %H:%i:%s')
+        END AS attendanceMarkedAt
       FROM students s
       LEFT JOIN student_attendance a
         ON a.student_id = s.id AND a.attendance_date = ?
       ORDER BY s.full_name, s.admission_number`,
-      [date],
+      [attendanceDate],
     )
-    response.json({ students })
+    const [summaryRows] = await pool.execute(
+      `SELECT
+        COUNT(s.id) AS total,
+        COALESCE(SUM(a.status = 'present'), 0) AS present,
+        COALESCE(SUM(a.status = 'absent'), 0) AS absent,
+        COALESCE(SUM(a.status = 'late'), 0) AS late,
+        COALESCE(SUM(a.status IS NULL OR a.status = 'unmarked'), 0) AS unmarked
+      FROM students s
+      LEFT JOIN student_attendance a
+        ON a.student_id = s.id AND a.attendance_date = ?`,
+      [attendanceDate],
+    )
+    response.json({ attendanceDate, students, summary: summaryRows[0] })
   } catch (error) {
     next(error)
   }
 })
 
 app.post('/api/students', requireStaff, async (request, response, next) => {
-  const { admissionNumber, name, trade, className, date } = request.body ?? {}
+  const { admissionNumber, name, trade, className } = request.body ?? {}
+  if (request.body?.date !== undefined) {
+    response.status(400).json({ message: 'Attendance date is set by the system.' })
+    return
+  }
+
   if (
     typeof admissionNumber !== 'string'
     || !admissionNumber.trim()
@@ -313,10 +329,9 @@ app.post('/api/students', requireStaff, async (request, response, next) => {
     || typeof className !== 'string'
     || !className.trim()
     || className.trim().length > 50
-    || !isValidAttendanceDate(date)
   ) {
     response.status(400).json({
-      message: 'Enter a valid admission number, student name, trade, class, and date.',
+      message: 'Enter a valid admission number, student name, trade, and class.',
     })
     return
   }
@@ -333,8 +348,8 @@ app.post('/api/students', requireStaff, async (request, response, next) => {
     )
     const [attendanceResult] = await connection.execute(
       `INSERT INTO student_attendance (student_id, attendance_date, status, recorded_by)
-      VALUES (?, ?, 'unmarked', ?)`,
-      [studentResult.insertId, date, request.authUserId],
+      VALUES (?, CURRENT_DATE(), 'unmarked', ?)`,
+      [studentResult.insertId, request.authUserId],
     )
 
     await connection.commit()
@@ -430,13 +445,13 @@ app.put('/api/students/:studentId', requireStaff, async (request, response, next
 })
 
 app.get('/api/attendance/summary', requireStaff, async (request, response, next) => {
-  const date = request.query.date
-  if (!isValidAttendanceDate(date)) {
-    response.status(400).json({ message: 'Enter a valid attendance date.' })
+  if (request.query.date !== undefined) {
+    response.status(400).json({ message: 'Attendance date is set by the system.' })
     return
   }
 
   try {
+    const attendanceDate = await getSystemAttendanceDate()
     const [rows] = await pool.execute(
       `SELECT
         COUNT(s.id) AS total,
@@ -447,36 +462,40 @@ app.get('/api/attendance/summary', requireStaff, async (request, response, next)
       FROM students s
       LEFT JOIN student_attendance a
         ON a.student_id = s.id AND a.attendance_date = ?`,
-      [date],
+      [attendanceDate],
     )
-    response.json({ date, summary: rows[0] })
+    response.json({ attendanceDate, summary: rows[0] })
   } catch (error) {
     next(error)
   }
 })
 
 app.post('/api/attendance', requireStaff, async (request, response, next) => {
-  const { studentId, date, status } = request.body ?? {}
+  const { studentId, status } = request.body ?? {}
+  if (request.body?.date !== undefined) {
+    response.status(400).json({ message: 'Attendance date is set by the system.' })
+    return
+  }
+
   const parsedStudentId = Number(studentId)
   if (
     !Number.isSafeInteger(parsedStudentId)
     || parsedStudentId < 1
-    || !isValidAttendanceDate(date)
     || !attendanceStatuses.has(status)
   ) {
-    response.status(400).json({ message: 'Enter a valid student, date, and attendance status.' })
+    response.status(400).json({ message: 'Enter a valid student and attendance status.' })
     return
   }
 
   try {
     const [result] = await pool.execute(
       `INSERT INTO student_attendance (student_id, attendance_date, status, recorded_by)
-      VALUES (?, ?, ?, ?)`,
-      [parsedStudentId, date, status, request.authUserId],
+      VALUES (?, CURRENT_DATE(), ?, ?)`,
+      [parsedStudentId, status, request.authUserId],
     )
     response.status(201).json({
       message: 'Attendance recorded.',
-      attendance: { id: result.insertId, studentId: parsedStudentId, date, status },
+      attendance: { id: result.insertId, studentId: parsedStudentId, status },
     })
   } catch (error) {
     if (error.code === 'ER_NO_REFERENCED_ROW_2') {
@@ -491,14 +510,18 @@ app.post('/api/attendance', requireStaff, async (request, response, next) => {
 
 app.put('/api/attendance/:studentId', requireStaff, async (request, response, next) => {
   const studentId = Number(request.params.studentId)
-  const { date, status } = request.body ?? {}
+  const { status } = request.body ?? {}
+  if (request.body?.date !== undefined) {
+    response.status(400).json({ message: 'Attendance date is set by the system.' })
+    return
+  }
+
   if (
     !Number.isSafeInteger(studentId)
     || studentId < 1
-    || !isValidAttendanceDate(date)
     || !attendanceStatuses.has(status)
   ) {
-    response.status(400).json({ message: 'Enter a valid student, date, and attendance status.' })
+    response.status(400).json({ message: 'Enter a valid student and attendance status.' })
     return
   }
 
@@ -506,24 +529,26 @@ app.put('/api/attendance/:studentId', requireStaff, async (request, response, ne
     const [result] = await pool.execute(
       `UPDATE student_attendance
       SET status = ?, recorded_by = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE student_id = ? AND attendance_date = ?`,
-      [status, request.authUserId, studentId, date],
+      WHERE student_id = ? AND attendance_date = CURRENT_DATE()`,
+      [status, request.authUserId, studentId],
     )
 
     if (result.affectedRows === 0) {
       const [records] = await pool.execute(
         `SELECT id FROM student_attendance
-        WHERE student_id = ? AND attendance_date = ?
+        WHERE student_id = ? AND attendance_date = CURRENT_DATE()
         LIMIT 1`,
-        [studentId, date],
+        [studentId],
       )
       if (records.length === 0) {
-        response.status(404).json({ message: 'Attendance record not found for this student and date.' })
+        response.status(404).json({
+          message: "Today's attendance record was not found. Only today's attendance can be updated.",
+        })
         return
       }
     }
 
-    response.json({ message: 'Attendance updated.', attendance: { studentId, date, status } })
+    response.json({ message: "Today's attendance updated.", attendance: { studentId, status } })
   } catch (error) {
     next(error)
   }

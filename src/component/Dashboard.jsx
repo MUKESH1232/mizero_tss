@@ -46,10 +46,12 @@ const trades = [
 ]
 const attendanceStatuses = ['present', 'absent', 'late']
 
-function todayLocal() {
-  const now = new Date()
-  now.setMinutes(now.getMinutes() - now.getTimezoneOffset())
-  return now.toISOString().slice(0, 10)
+function formatSystemDate(value) {
+  if (!value) return 'Loading…'
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeZone: 'UTC',
+  }).format(new Date(`${value}T00:00:00Z`))
 }
 
 async function readJson(response) {
@@ -62,17 +64,13 @@ async function readJson(response) {
   return result
 }
 
-async function loadStudentRecords(date) {
-  const query = `?date=${encodeURIComponent(date)}`
-  const [studentsResponse, summaryResponse] = await Promise.all([
-    fetch(`/api/students${query}`, { credentials: 'same-origin' }),
-    fetch(`/api/attendance/summary${query}`, { credentials: 'same-origin' }),
-  ])
-  const [studentsResult, summaryResult] = await Promise.all([
-    readJson(studentsResponse),
-    readJson(summaryResponse),
-  ])
-  return { students: studentsResult.students, summary: summaryResult.summary }
+async function loadStudentRecords() {
+  const result = await readJson(await fetch('/api/students', { credentials: 'same-origin' }))
+  return {
+    attendanceDate: result.attendanceDate,
+    students: result.students,
+    summary: result.summary,
+  }
 }
 
 function Dashboard() {
@@ -80,9 +78,9 @@ function Dashboard() {
   const [user, setUser] = useState(null)
   const [students, setStudents] = useState([])
   const [summary, setSummary] = useState(null)
-  const [date, setDate] = useState(todayLocal)
+  const [attendanceDate, setAttendanceDate] = useState('')
   const [loading, setLoading] = useState(true)
-  const [recordsLoading, setRecordsLoading] = useState(false)
+  const [recordsLoading, setRecordsLoading] = useState(true)
   const [savingStudent, setSavingStudent] = useState(false)
   const [editingStudent, setEditingStudent] = useState(null)
   const [savingAttendance, setSavingAttendance] = useState(null)
@@ -119,9 +117,10 @@ function Dashboard() {
     if (!user?.isStaff) return undefined
 
     let active = true
-    loadStudentRecords(date)
-      .then(({ students: nextStudents, summary: nextSummary }) => {
+    loadStudentRecords()
+      .then(({ attendanceDate: nextDate, students: nextStudents, summary: nextSummary }) => {
         if (!active) return
+        setAttendanceDate(nextDate)
         setStudents(nextStudents)
         setSummary(nextSummary)
         setError('')
@@ -141,10 +140,11 @@ function Dashboard() {
     return () => {
       active = false
     }
-  }, [date, navigate, user?.isStaff])
+  }, [navigate, user?.isStaff])
 
-  async function refreshRecords(forDate = date) {
-    const result = await loadStudentRecords(forDate)
+  async function refreshRecords() {
+    const result = await loadStudentRecords()
+    setAttendanceDate(result.attendanceDate)
     setStudents(result.students)
     setSummary(result.summary)
   }
@@ -165,14 +165,14 @@ function Dashboard() {
           method: isEditing ? 'PUT' : 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'same-origin',
-          body: JSON.stringify({ ...studentData, date }),
+          body: JSON.stringify(studentData),
         },
       ))
       form.reset()
       setEditingStudent(null)
       setNotice(result.message)
       try {
-        await refreshRecords(date)
+        await refreshRecords()
       } catch {
         setError('Student was saved, but the roster could not be refreshed.')
       }
@@ -193,8 +193,8 @@ function Dashboard() {
     const url = hasRecord ? `/api/attendance/${student.id}` : '/api/attendance'
     const method = hasRecord ? 'PUT' : 'POST'
     const body = hasRecord
-      ? { date, status }
-      : { studentId: student.id, date, status }
+      ? { status }
+      : { studentId: student.id, status }
 
     try {
       const result = await readJson(await fetch(url, {
@@ -203,7 +203,7 @@ function Dashboard() {
         credentials: 'same-origin',
         body: JSON.stringify(body),
       }))
-      await refreshRecords(date)
+      await refreshRecords()
       setNotice(result.message)
     } catch (requestError) {
       if (requestError.status === 401) navigate('/login', { replace: true })
@@ -298,16 +298,10 @@ function Dashboard() {
           <section className="portal-management" id="student-management">
             <div className="portal-heading">
               <div><span className="portal-overline">STAFF WORKSPACE</span><h2>Students & attendance</h2></div>
-              <label className="portal-date">Attendance date
-                <input
-                  type="date"
-                  value={date}
-                  onChange={(event) => {
-                    setRecordsLoading(true)
-                    setDate(event.target.value)
-                  }}
-                />
-              </label>
+              <div className="portal-date">
+                <span>Attendance date · system set</span>
+                <output>{formatSystemDate(attendanceDate)}</output>
+              </div>
             </div>
 
             <div className="portal-summary" aria-label="Attendance summary">
@@ -351,7 +345,7 @@ function Dashboard() {
                     : (
                       <div className="portal-table-scroll">
                         <table className="portal-table">
-                          <thead><tr><th>Student</th><th>Admission no.</th><th>Trade / class</th><th>Attendance</th><th>Actions</th></tr></thead>
+                          <thead><tr><th>Student</th><th>Admission no.</th><th>Trade / class</th><th>Attendance</th><th>Marked at (system)</th><th>Actions</th></tr></thead>
                           <tbody>{students.map((student) => (
                             <tr key={student.id}>
                               <td data-label="Student"><strong>{student.name}</strong></td>
@@ -371,6 +365,11 @@ function Dashboard() {
                                     <option key={status} value={status}>{status[0].toUpperCase() + status.slice(1)}</option>
                                   ))}
                                 </select>
+                              </td>
+                              <td data-label="Marked at (system)">
+                                {student.attendanceMarkedAt
+                                  ? <time dateTime={student.attendanceMarkedAt.replace(' ', 'T')}>{student.attendanceMarkedAt}</time>
+                                  : '—'}
                               </td>
                               <td data-label="Actions">
                                 <button

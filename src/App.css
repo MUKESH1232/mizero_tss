@@ -1809,14 +1809,15 @@
   font-weight: 700;
 }
 
-.portal-date input {
-  min-height: 34px;
+.portal-date output {
   border: 1px solid #e1e8dd;
   border-radius: 6px;
-  padding: 0 8px;
+  padding: 8px;
   color: #405349;
-  background: #fffefa;
+  background: #f7f9f4;
   font: inherit;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .portal-summary {
@@ -1905,7 +1906,6 @@
 
 .portal-form input:focus,
 .portal-form select:focus,
-.portal-date input:focus,
 .portal-table select:focus {
   border-color: #6b9b76;
   box-shadow: 0 0 0 3px rgba(94, 152, 117, .13);
@@ -2135,10 +2135,6 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 4px;
-  }
-
-  .portal-date input {
-    width: 140px;
   }
 
   .portal-summary {
